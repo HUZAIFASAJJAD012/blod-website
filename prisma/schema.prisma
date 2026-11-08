@@ -1,0 +1,596 @@
+// FixLayer data model. See docs/ARCHITECTURE.md for the rationale behind each table.
+// Migrations are reviewed SQL in prisma/migrations; the full-text search column is
+// added by hand in the init migration (generated tsvector + GIN index).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────── Enums ─────────────────────────
+
+enum Role {
+  OWNER
+  ADMIN
+  EDITOR
+  AUTHOR
+}
+
+enum UserStatus {
+  ACTIVE
+  INVITED
+  SUSPENDED
+}
+
+enum ArticleStatus {
+  DRAFT
+  IN_REVIEW
+  APPROVED
+  SCHEDULED
+  PUBLISHED
+  ARCHIVED
+}
+
+enum ArticleType {
+  TROUBLESHOOTING
+  TUTORIAL
+  COMPARISON
+  CHECKLIST
+  OPINION
+  NEWS
+}
+
+enum Visibility {
+  PUBLIC
+  PRIVATE
+}
+
+enum SchemaType {
+  BLOG_POSTING
+  ARTICLE
+  NEWS_ARTICLE
+}
+
+enum ReferenceType {
+  OFFICIAL_DOCS
+  PRIMARY_SOURCE
+  SECONDARY_SOURCE
+  TOOL
+}
+
+enum ContactStatus {
+  NEW
+  READ
+  REPLIED
+  ARCHIVED
+  SPAM
+}
+
+enum NewsletterStatus {
+  PENDING
+  CONFIRMED
+  UNSUBSCRIBED
+}
+
+enum CheckSeverity {
+  INFO
+  WARNING
+  ERROR
+}
+
+enum OutboxStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+// ───────────────────────── Identity ─────────────────────────
+
+model User {
+  id           String     @id @default(cuid())
+  name         String
+  email        String     @unique
+  passwordHash String?
+  role         Role       @default(AUTHOR)
+  status       UserStatus @default(ACTIVE)
+  imageId      String?
+  mfaSecret    String? // base32 TOTP secret, encrypted at rest with APP_ENCRYPTION_KEY
+  mfaEnabled   Boolean    @default(false)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  lastLoginAt  DateTime?
+
+  image             Media?               @relation("UserImage", fields: [imageId], references: [id], onDelete: SetNull)
+  profile           AuthorProfile?
+  sessions          Session[]
+  articles          Article[]            @relation("ArticleAuthor")
+  reviewedArticles  Article[]            @relation("ArticleReviewer")
+  revisions         ArticleRevision[]
+  uploads           Media[]              @relation("MediaUploader")
+  auditLogs         AuditLog[]
+  resetTokens       PasswordResetToken[]
+  invitationsSent   Invitation[]
+  previewTokens     PreviewToken[]
+  settingsUpdated   SiteSetting[]
+
+  @@index([role, status])
+  @@map("users")
+}
+
+model Session {
+  id          String   @id // SHA-256 hash of the cookie token; raw token never stored
+  userId      String
+  expiresAt   DateTime
+  mfaPending  Boolean  @default(false)
+  ipHash      String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+model Invitation {
+  id          String    @id @default(cuid())
+  email       String
+  name        String
+  role        Role
+  tokenHash   String    @unique
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  revokedAt   DateTime?
+  invitedById String
+  createdAt   DateTime  @default(now())
+
+  invitedBy User @relation(fields: [invitedById], references: [id], onDelete: Cascade)
+
+  @@index([email])
+  @@map("invitations")
+}
+
+model AuthorProfile {
+  userId            String  @id
+  slug              String  @unique
+  bio               String  @default("")
+  roleTitle         String  @default("")
+  qualificationsText String @default("")
+  socialLinks       Json    @default("[]")
+  isPublic          Boolean @default(false)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("author_profiles")
+}
+
+// ───────────────────────── Content ─────────────────────────
+
+model Category {
+  id             String   @id @default(cuid())
+  name           String
+  slug           String   @unique
+  description    String   @default("")
+  intro          String   @default("") // editorial introduction shown on the category page
+  faq            Json     @default("[]") // [{question, answer}] rendered as plain content, never FAQPage schema
+  seoTitle       String?
+  seoDescription String?
+  parentId       String?
+  featuredMediaId String?
+  icon           String?  // Lucide icon key
+  sortOrder      Int      @default(0)
+  visible        Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  parent            Category?         @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children          Category[]        @relation("CategoryTree")
+  featuredMedia     Media?            @relation("CategoryMedia", fields: [featuredMediaId], references: [id], onDelete: SetNull)
+  primaryArticles   Article[]         @relation("PrimaryCategory")
+  secondaryArticles ArticleCategory[]
+
+  @@index([visible, sortOrder])
+  @@map("categories")
+}
+
+model Tag {
+  id          String       @id @default(cuid())
+  name        String
+  slug        String       @unique
+  description String?
+  createdAt   DateTime     @default(now())
+  articles    ArticleTag[]
+
+  @@map("tags")
+}
+
+model Article {
+  id                    String        @id @default(cuid())
+  title                 String
+  slug                  String        @unique
+  excerpt               String        @default("")
+  bodyJson              Json          @default("{\"type\":\"doc\",\"content\":[]}")
+  bodyText              String        @default("") // plain text derived from bodyJson, feeds search + checks
+  bodyHtmlSanitized     String? // optional cache; public pages render from bodyJson via an allowlist renderer
+  primaryCategoryId     String
+  authorId              String
+  reviewerId            String?
+  reviewedAt            DateTime?
+  status                ArticleStatus @default(DRAFT)
+  type                  ArticleType   @default(TROUBLESHOOTING)
+  visibility            Visibility    @default(PUBLIC)
+  schemaType            SchemaType    @default(BLOG_POSTING)
+  coverMediaId          String?
+  metaTitle             String?
+  metaDescription       String?
+  canonicalOverride     String?
+  robotsIndex           Boolean       @default(true)
+  robotsFollow          Boolean       @default(true)
+  ogTitle               String?
+  ogDescription         String?
+  ogImageId             String?
+  firstPublishedAt      DateTime?
+  scheduledAt           DateTime?
+  scheduleTimezone      String?
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+  materiallyUpdatedAt   DateTime?
+  lastVerifiedAt        DateTime?
+  archivedAt            DateTime?
+  readingMinutes        Int?
+  featuredRank          Int? // homepage order; only honoured for published articles
+  featuredOnHome        Boolean       @default(false)
+  pinnedUntil           DateTime?
+  affiliateDisclosureFlag Boolean     @default(false)
+  affiliateDisclosureText String?
+  // Evidence & editorial integrity
+  testedEnvironment     Json          @default("[]") // [{label, value}] e.g. WordPress 6.x, PHP 8.3
+  verification          Json          @default("{}") // {stepsVerified, originalScreenshots, claimsSourced}
+  correctionsNote       String?
+  revisionReason        String?
+  // Internal planning (never rendered publicly)
+  searchIntent          String?
+  secondaryQueries      String[]      @default([])
+  brief                 Json          @default("{}")
+  version               Int           @default(1) // optimistic concurrency for autosave
+  // Generated column (see init migration): weighted tsvector of title, excerpt, bodyText.
+  searchVector          Unsupported("tsvector")?
+
+  primaryCategory     Category          @relation("PrimaryCategory", fields: [primaryCategoryId], references: [id], onDelete: Restrict)
+  author              User              @relation("ArticleAuthor", fields: [authorId], references: [id], onDelete: Restrict)
+  reviewer            User?             @relation("ArticleReviewer", fields: [reviewerId], references: [id], onDelete: SetNull)
+  coverMedia          Media?            @relation("ArticleCover", fields: [coverMediaId], references: [id], onDelete: SetNull)
+  ogImage             Media?            @relation("ArticleOgImage", fields: [ogImageId], references: [id], onDelete: SetNull)
+  tags                ArticleTag[]
+  secondaryCategories ArticleCategory[]
+  revisions           ArticleRevision[]
+  references          Reference[]
+  related             RelatedArticle[]  @relation("RelatedFrom")
+  relatedTo           RelatedArticle[]  @relation("RelatedTo")
+  checks              ContentCheck[]
+  views               ArticleViewDaily[]
+  previewTokens       PreviewToken[]
+
+  @@index([status, firstPublishedAt(sort: Desc)])
+  @@index([primaryCategoryId, status, firstPublishedAt(sort: Desc)])
+  @@index([authorId, status])
+  @@index([status, scheduledAt])
+  @@index([materiallyUpdatedAt(sort: Desc)])
+  @@index([featuredOnHome, featuredRank])
+  @@index([status, updatedAt(sort: Desc)], map: "articles_published_updated_idx")
+  @@map("articles")
+}
+
+model ArticleTag {
+  articleId String
+  tagId     String
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  tag     Tag     @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([articleId, tagId])
+  @@index([tagId])
+  @@map("article_tags")
+}
+
+model ArticleCategory {
+  articleId  String
+  categoryId String
+
+  article  Article  @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@id([articleId, categoryId])
+  @@index([categoryId])
+  @@map("article_categories")
+}
+
+model ArticleRevision {
+  id           String   @id @default(cuid())
+  articleId    String
+  authorId     String
+  version      Int
+  snapshotJson Json
+  summary      String   @default("")
+  createdAt    DateTime @default(now())
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  author  User    @relation(fields: [authorId], references: [id], onDelete: Restrict)
+
+  @@unique([articleId, version])
+  @@index([articleId, createdAt(sort: Desc)])
+  @@map("article_revisions")
+}
+
+model Reference {
+  id            String        @id @default(cuid())
+  articleId     String
+  title         String
+  url           String
+  publisher     String?
+  accessedAt    DateTime
+  referenceType ReferenceType @default(OFFICIAL_DOCS)
+  isPrimary     Boolean       @default(false)
+  lastStatus    Int? // last link-health HTTP status
+  lastCheckedAt DateTime?
+  sortOrder     Int           @default(0)
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@index([articleId])
+  @@map("references")
+}
+
+model RelatedArticle {
+  articleId String
+  relatedId String
+  sortOrder Int    @default(0)
+
+  article Article @relation("RelatedFrom", fields: [articleId], references: [id], onDelete: Cascade)
+  related Article @relation("RelatedTo", fields: [relatedId], references: [id], onDelete: Cascade)
+
+  @@id([articleId, relatedId])
+  @@map("related_articles")
+}
+
+model Media {
+  id              String   @id @default(cuid())
+  providerKey     String   @unique
+  fileUrl         String
+  width           Int
+  height          Int
+  mime            String
+  size            Int
+  alt             String   @default("")
+  caption         String?
+  title           String?
+  copyrightHolder String?
+  license         String?
+  sourceUrl       String?
+  focalX          Float?
+  focalY          Float?
+  uploadedById    String
+  createdAt       DateTime @default(now())
+
+  uploadedBy     User       @relation("MediaUploader", fields: [uploadedById], references: [id], onDelete: Restrict)
+  covers         Article[]  @relation("ArticleCover")
+  ogImages       Article[]  @relation("ArticleOgImage")
+  userImages     User[]     @relation("UserImage")
+  categoryImages Category[] @relation("CategoryMedia")
+
+  @@index([createdAt(sort: Desc)])
+  @@map("media")
+}
+
+model PreviewToken {
+  id          String   @id @default(cuid())
+  tokenHash   String   @unique
+  articleId   String
+  createdById String
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+
+  article   Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  createdBy User    @relation(fields: [createdById], references: [id], onDelete: Cascade)
+
+  @@index([articleId])
+  @@map("preview_tokens")
+}
+
+// ───────────────────────── SEO / ops ─────────────────────────
+
+model Redirect {
+  id          String    @id @default(cuid())
+  fromPath    String    @unique
+  toPathOrUrl String
+  httpStatus  Int       @default(301)
+  reason      String    @default("")
+  enabled     Boolean   @default(true)
+  hits        Int       @default(0)
+  lastHitAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@map("redirects")
+}
+
+model NotFoundEvent {
+  id        String   @id @default(cuid())
+  path      String   @unique
+  hits      Int      @default(1)
+  referrer  String?
+  firstSeenAt DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+
+  @@index([lastSeenAt(sort: Desc)])
+  @@map("not_found_events")
+}
+
+model ContentCheck {
+  id         String        @id @default(cuid())
+  articleId  String
+  checkType  String
+  severity   CheckSeverity
+  resultJson Json
+  checkedAt  DateTime      @default(now())
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@index([articleId])
+  @@index([severity, checkType])
+  @@map("content_checks")
+}
+
+model ArticleViewDaily {
+  articleId String
+  day       DateTime @db.Date
+  views     Int      @default(0)
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@id([articleId, day])
+  @@map("article_views_daily")
+}
+
+// ───────────────────────── Monetization / settings ─────────────────────────
+
+model AdPlacement {
+  id                  String   @id @default(cuid())
+  key                 String   @unique // e.g. article_after_intro, article_before_related
+  label               String
+  adUnitId            String? // data-ad-slot value from AdSense
+  enabled             Boolean  @default(false)
+  positions           Json     @default("{}") // {minHeightDesktop, minHeightMobile, format}
+  minContentThreshold Int?     // minimum words before this slot may render
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@map("ad_placements")
+}
+
+model SiteSetting {
+  key         String   @id
+  valueJson   Json
+  updatedAt   DateTime @updatedAt
+  updatedById String?
+
+  updatedBy User? @relation(fields: [updatedById], references: [id], onDelete: SetNull)
+
+  @@map("site_settings")
+}
+
+// ───────────────────────── Leads ─────────────────────────
+
+model ContactSubmission {
+  id        String        @id @default(cuid())
+  name      String
+  email     String
+  subject   String
+  message   String
+  topic     String?
+  pageUrl   String?
+  consent   Boolean
+  status    ContactStatus @default(NEW)
+  ipHash    String?
+  createdAt DateTime      @default(now())
+
+  @@index([status, createdAt(sort: Desc)])
+  @@index([createdAt])
+  @@map("contact_submissions")
+}
+
+model NewsletterSubscription {
+  id               String           @id @default(cuid())
+  email            String           @unique
+  consentAt        DateTime
+  confirmedAt      DateTime?
+  unsubscribedAt   DateTime?
+  status           NewsletterStatus @default(PENDING)
+  source           String?
+  confirmTokenHash String?          @unique
+  confirmExpiresAt DateTime?
+  unsubscribeToken String           @unique // random, used in every email footer
+  createdAt        DateTime         @default(now())
+
+  @@index([status])
+  @@map("newsletter_subscriptions")
+}
+
+model EmailOutbox {
+  id        String       @id @default(cuid())
+  to        String
+  subject   String
+  text      String
+  html      String?
+  replyTo   String?
+  kind      String
+  status    OutboxStatus @default(PENDING)
+  attempts  Int          @default(0)
+  lastError String?
+  sendAfter DateTime     @default(now())
+  sentAt    DateTime?
+  createdAt DateTime     @default(now())
+
+  @@index([status, sendAfter])
+  @@map("email_outbox")
+}
+
+// ───────────────────────── Security / audit ─────────────────────────
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  actorId     String?
+  action      String
+  entityType  String
+  entityId    String?
+  summaryJson Json     @default("{}")
+  ipHash      String?
+  createdAt   DateTime @default(now())
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId])
+  @@index([createdAt(sort: Desc)])
+  @@index([actorId])
+  @@map("audit_logs")
+}
+
+model RateLimitBucket {
+  key         String   @id // e.g. login:<ipHash>
+  count       Int
+  windowStart DateTime
+  expiresAt   DateTime
+
+  @@index([expiresAt])
+  @@map("rate_limit_buckets")
+}
+
+model JobRun {
+  id         String    @id @default(cuid())
+  job        String
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+  resultJson Json      @default("{}")
+
+  @@index([job, startedAt(sort: Desc)])
+  @@map("job_runs")
+}
