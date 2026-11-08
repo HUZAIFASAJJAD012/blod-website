@@ -123,9 +123,12 @@ function securityHeaders(res: NextResponse, csp: string) {
 export async function proxy(req: NextRequest, event: NextFetchEvent) {
   const url = req.nextUrl;
   const prod = process.env.NODE_ENV === "production";
+  const isHealthCheck = url.pathname === "/api/health";
 
   // 1. Canonical origin (production only; local dev uses whatever host it runs on).
-  if (prod && process.env.SITE_URL) {
+  // Railway probes the container through its internal host, so health checks
+  // must reach the route directly instead of following the public redirect.
+  if (prod && process.env.SITE_URL && !isHealthCheck) {
     const canonical = new URL(process.env.SITE_URL);
     const host = req.headers.get("x-forwarded-host") ?? req.headers.get("host") ?? url.host;
     const proto = req.headers.get("x-forwarded-proto") ?? url.protocol.replace(":", "");
