@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev --port 3100",
-    "build": "next build",
+    "build": "node scripts/build.mjs",
     "start": "next start --port 3100",
     "lint": "eslint",
     "typecheck": "next typegen && tsc --noEmit",

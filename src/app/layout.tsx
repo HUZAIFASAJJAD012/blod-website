@@ -2,10 +2,6 @@ import type { Metadata, Viewport } from "next";
 import { IBM_Plex_Mono, IBM_Plex_Sans } from "next/font/google";
 import "./globals.css";
 
-// Railway builds run outside the project's private network, so database-backed
-// routes must render after the application starts inside that network.
-export const dynamic = "force-dynamic";
-
 const plexSans = IBM_Plex_Sans({
   subsets: ["latin"],
   weight: ["400", "500", "600"],
