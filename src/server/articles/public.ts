@@ -1,5 +1,6 @@
 import "server-only";
 import { cache } from "react";
+import { connection } from "next/server";
 import { db, Prisma } from "@/lib/db";
 
 /**
@@ -129,6 +130,9 @@ export async function getHomepageData() {
 }
 
 export const getCategoriesWithCounts = cache(async () => {
+  // Header, footer, and global error routes all use this query. Waiting for an
+  // incoming request keeps Railway builds independent of its private database.
+  await connection();
   const now = new Date();
   const cats = await db.category.findMany({
     where: { visible: true },
