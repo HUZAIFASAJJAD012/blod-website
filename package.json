@@ -17,7 +17,9 @@
     "db:seed:demo": "tsx prisma/seed-demo.ts",
     "db:studio": "prisma studio",
     "postinstall": "prisma generate",
-    "cron:local": "node scripts/cron-local.mjs"
+    "cron:local": "node scripts/cron-local.mjs",
+    "db:start": "pg_isready -q -h localhost -p 5434 || pg_ctl -D .pgdata -o \"-p 5434 -k /tmp\" -l .pgdata/server.log start",
+    "db:stop": "pg_ctl -D .pgdata stop"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1163.0",
@@ -61,6 +63,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.4.5",
     "prisma": "7.10.1",
+    "railway": "^3.16.0",
     "tailwindcss": "^4",
     "tsx": "^4.23.15",
     "typescript": "^5",
